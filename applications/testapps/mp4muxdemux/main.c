@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <gpac/filters.h>
 #include <gpac/tools.h>
@@ -14,13 +15,15 @@ static void print_usage(const char *exe)
         "Usage:\n"
         "  %s mux <in.h264> <in.aac> <out.mp4> <fps>\n"
         "  %s demux <in.mp4> <out.h264> <out.aac>\n"
-    "  %s make30\n"
+        "  %s demux_frames <in.mp4> <out_frames_dir>\n"
+        "  %s make30\n"
         "\n"
         "Notes:\n"
         "  - H.264 input must be Annex B (start codes).\n"
         "  - AAC input must be ADTS.\n"
-        "  - fps can be like 30 or 30000/1001.\n",
-    exe, exe, exe);
+        "  - fps can be like 30 or 30000/1001.\n"
+        "  - demux_frames: extract each H.264 frame to separate file in folder.\n",
+    exe, exe, exe, exe);
 }
 
 static GF_Err run_session(GF_FilterSession *fs)
@@ -157,6 +160,126 @@ static GF_Err build_demux(const char *in_mp4, const char *out_h264, const char *
         return e;
     }
     return build_demux_one(in_mp4, "audio", out_aac, "ufadts");
+}
+
+// Split H.264 file into individual frames
+static GF_Err split_h264_frames(const char *h264_path, const char *out_dir)
+{
+    // Create output directory
+    if (mkdir(out_dir, 0755) != 0 && errno != EEXIST) {
+        fprintf(stderr, "Failed to create directory: %s\n", out_dir);
+        return GF_IO_ERR;
+    }
+
+    FILE *f = fopen(h264_path, "rb");
+    if (!f) {
+        fprintf(stderr, "Failed to open H.264 file: %s\n", h264_path);
+        return GF_URL_ERROR;
+    }
+
+    u32 frame_count = 0;
+    FILE *frame_file = NULL;
+    char frame_path[GF_MAX_PATH];
+    
+    // Read entire file into memory for easier processing
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    
+    unsigned char *buf = (unsigned char *)malloc(file_size);
+    if (!buf) {
+        fprintf(stderr, "Failed to allocate memory\n");
+        fclose(f);
+        return GF_OUT_OF_MEM;
+    }
+    
+    if (fread(buf, 1, file_size, f) != file_size) {
+        fprintf(stderr, "Failed to read H.264 file\n");
+        free(buf);
+        fclose(f);
+        return GF_IO_ERR;
+    }
+    fclose(f);
+    
+    // Scan for start codes and extract frames
+    unsigned long i = 0;
+    
+    while (i < file_size) {
+        int start_code_len = 0;
+        
+        // Check for 4-byte start code
+        if (i + 4 <= file_size && 
+            buf[i] == 0x00 && buf[i+1] == 0x00 && 
+            buf[i+2] == 0x00 && buf[i+3] == 0x01) {
+            start_code_len = 4;
+        }
+        // Check for 3-byte start code (but not 4-byte)
+        else if (i + 3 <= file_size && 
+                 buf[i] == 0x00 && buf[i+1] == 0x00 && buf[i+2] == 0x01 &&
+                 (i + 3 >= file_size || buf[i+3] != 0x00)) {
+            start_code_len = 3;
+        }
+        
+        if (start_code_len > 0) {
+            // If already have a frame open, save it
+            if (frame_file) {
+                fclose(frame_file);
+                frame_count++;
+            }
+            
+            // Open new frame file
+            snprintf(frame_path, sizeof(frame_path), "%s/frame_%05u.h264", out_dir, frame_count);
+            frame_file = fopen(frame_path, "wb");
+            if (!frame_file) {
+                fprintf(stderr, "Failed to create frame file: %s\n", frame_path);
+                free(buf);
+                return GF_IO_ERR;
+            }
+            
+            i += start_code_len;
+        } else {
+            // Write data to current frame
+            if (frame_file) {
+                if (fwrite(&buf[i], 1, 1, frame_file) != 1) {
+                    fprintf(stderr, "Failed to write frame data at offset %lu\n", i);
+                    fclose(frame_file);
+                    free(buf);
+                    return GF_IO_ERR;
+                }
+            }
+            i++;
+        }
+    }
+    
+    // Close last frame
+    if (frame_file) {
+        fclose(frame_file);
+        frame_count++;
+    }
+    
+    free(buf);
+    
+    fprintf(stderr, "Extracted %u frames to %s\n", frame_count, out_dir);
+    return GF_OK;
+}
+
+static GF_Err build_demux_frames(const char *in_mp4, const char *out_frames_dir)
+{
+    // First, extract H.264 stream to temporary file
+    const char *temp_h264 = "/tmp/temp_demux.h264";
+    
+    GF_Err e = build_demux_one(in_mp4, "video", temp_h264, "ufnalu");
+    if (e < GF_OK) {
+        return e;
+    }
+    
+    // Then split into individual frames
+    e = split_h264_frames(temp_h264, out_frames_dir);
+    
+    // Clean up temp file
+    unlink(temp_h264);
+    
+    return e;
 }
 
 typedef struct
@@ -459,9 +582,9 @@ static GF_Err build_concat_h264(const char *frames_dir, const char *out_path, u3
 
 static GF_Err build_sample_30s(void)
 {
-    const char *frames_dir = "/Users/lance//work/Github/gpac/applications/testapps/mp4muxdemux/h264";
-    const char *aac_path = "/Users/lance//work/Github/gpac/applications/testapps/mp4muxdemux/aac.aac";
-    const char *out_mp4 = "/Users/lance//work/Github/gpac/applications/testapps/mp4muxdemux/out_30s.mp4";
+    const char *frames_dir = "applications/testapps/mp4muxdemux/h264";
+    const char *aac_path = "applications/testapps/mp4muxdemux/aac.aac";
+    const char *out_mp4 = "applications/testapps/mp4muxdemux/out_30s.mp4";
     const char *fps_str = "30";
     const u32 target_seconds = 30;
     const u32 fps = 30;
@@ -516,6 +639,13 @@ int main(int argc, char **argv)
             return 2;
         }
         e = build_demux(argv[2], argv[3], argv[4]);
+    } else if (!strcmp(argv[1], "demux_frames")) {
+        if (argc != 4) {
+            print_usage(argv[0]);
+            gf_sys_close();
+            return 2;
+        }
+        e = build_demux_frames(argv[2], argv[3]);
     } else if (!strcmp(argv[1], "make30")) {
         if (argc != 2) {
             print_usage(argv[0]);

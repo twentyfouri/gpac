@@ -138,44 +138,68 @@ make -C applications/testapps/mp4muxdemux
 
 ### 執行 mp4muxdemux
 
-#### 1. 生成 30 秒測試 MP4
+**重要：執行前需設定正確的動態庫路徑**
 ```bash
 cd /Users/lance/work/Github/gpac
-DYLD_LIBRARY_PATH=./bin/gcc ./bin/gcc/mp4muxdemux make30
+export DYLD_LIBRARY_PATH="./local/lib:./bin/gcc:$DYLD_LIBRARY_PATH"
 ```
 
+#### 1. 生成 30 秒測試 MP4
+```bash
+./bin/gcc/mp4muxdemux make30
+```
 輸出檔案：`applications/testapps/mp4muxdemux/out_30s.mp4` (5.7 MB)
 
 #### 2. 解封裝 MP4
 ```bash
-DYLD_LIBRARY_PATH=./bin/gcc ./bin/gcc/mp4muxdemux demux \
+./bin/gcc/mp4muxdemux demux \
 applications/testapps/mp4muxdemux/out_30s.mp4 \
 /tmp/out.h264 \
 /tmp/out.aac
 ```
-
 輸出：
-- `/tmp/out.h264` - H.264 視頻流
-- `/tmp/out.aac` - AAC 音頻流
+- `/tmp/out.h264` - H.264 視頻流 (5.6 MB)
+- `/tmp/out.aac` - AAC 音頻流 (58 KB)
 
-#### 3. 封裝 MP4
+#### 3. 解封裝 MP4（逐幀提取）
+👉 **新功能！** 將所有 frame 提取到單獨的檔案
 ```bash
-DYLD_LIBRARY_PATH=./bin/gcc ./bin/gcc/mp4muxdemux mux \
+./bin/gcc/mp4muxdemux demux_frames \
+applications/testapps/mp4muxdemux/out_30s.mp4 \
+/tmp/frames_dir
+```
+輸出：
+- `/tmp/frames_dir/frame_00000.h264` - 第 0 幀
+- `/tmp/frames_dir/frame_00001.h264` - 第 1 幀
+- ...
+- `/tmp/frames_dir/frame_01979.h264` - 第 1979 幀（共 1980 幀，30 fps × 66 秒）
+- 總大小：12 MB
+
+#### 4. 封裝 MP4
+```bash
+./bin/gcc/mp4muxdemux mux \
 /tmp/out.h264 \
 /tmp/out.aac \
 /tmp/remux.mp4 \
 30
 ```
-
-輸出：`/tmp/remux.mp4` - 重新封裝的 MP4（30 fps）
+輸出：`/tmp/remux.mp4` - 重新封裝的 MP4（30 fps, 5.7 MB）
 
 ### 使用自訂素材
 ```bash
-# 用 h264 目錄的逐幀檔案 + aac 檔案
-make -C applications/testapps/mp4muxdemux
+./bin/gcc/mp4muxdemux mux \
+applications/testapps/mp4muxdemux/h264/test_frame0.h264 \
+applications/testapps/mp4muxdemux/aac.aac \
+/tmp/custom_output.mp4 \
+30
+```
 
-DYLD_LIBRARY_PATH=./bin/gcc ./bin/gcc/mp4muxdemux make30
-``` 
+### 測試結果 (v2.4.0-lance-dev)
+✅ **所有功能正常運作**：
+- make30：成功生成 5.7 MB MP4
+- demux：成功解封裝到 H264 + AAC
+- demux_frames：成功逐幀提取 1980 個 H.264 幀檔案
+- mux：成功重新封裝為 MP4 
 
 
 # Getting started
