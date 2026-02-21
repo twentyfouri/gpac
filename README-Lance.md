@@ -161,8 +161,8 @@ applications/testapps/mp4muxdemux/out_30s.mp4 \
 - `/tmp/out.h264` - H.264 視頻流 (5.6 MB)
 - `/tmp/out.aac` - AAC 音頻流 (58 KB)
 
-#### 3. 解封裝 MP4（逐幀提取）
-👉 **新功能！** 將所有 frame 提取到單獨的檔案
+#### 3. 解封裝 MP4（逐幀提取）⭐ 支援 Metadata
+👉 **新功能！** 將所有 frame 提取到單獨的檔案，**並自動提取 metadata track**（如果存在）
 ```bash
 ./bin/gcc/mp4muxdemux demux_frames \
 applications/testapps/mp4muxdemux/out_30s.mp4 \
@@ -173,7 +173,20 @@ applications/testapps/mp4muxdemux/out_30s.mp4 \
 - `/tmp/frames_dir/frame_00001.h264` - 第 1 幀
 - ...
 - `/tmp/frames_dir/frame_01979.h264` - 第 1979 幀（總幀數視影片長度而定）
+- **`/tmp/frames_dir/metadata.ndjson`** - Metadata track（自動檢測並提取）⭐
 - 總大小視輸入影片而定
+
+**Metadata 提取特性**：
+- ✅ 自動檢測 MP4 中的 JSON metadata track
+- ✅ 提取到 `metadata.ndjson` 檔案（NDJSON 格式）
+- ✅ 與視頻幀同步（frame_id 對應）
+- ✅ 如果 MP4 沒有 metadata track，則只提取視頻幀
+
+**範例輸出**：
+```bash
+Extracted 1980 frames to /tmp/frames_dir
+✅ Extracted metadata track to /tmp/frames_dir/metadata.ndjson
+```
 
 #### 4. 加入 JSON Metadata Track（per-frame 檢測結果）⭐ 新功能
 👉 **目的**：將 per-frame 檢測結果（人臉檢測、物體偵測等）以 JSON 格式嵌入 MP4，並與影片播放時間同步。
@@ -295,9 +308,9 @@ applications/testapps/mp4muxdemux/aac.aac \
 
 ### 測試結果 (v2.4.0-lance-dev)
 ✅ **所有功能正常運作**：
-- make30：成功生成 5.7 MB MP4
+- make30：成功生成 5.7 MB MP4（包含 video + audio + metadata tracks）
 - demux：成功解封裝到 H264 + AAC
-- demux_frames：成功逐幀提取 1980 個 H.264 幀檔案（12 MB）
+- demux_frames：成功逐幀提取 1980 個 H.264 幀檔案（12 MB）+ **自動提取 metadata.ndjson（851 行）** ⭐
 - **add_metadata_track**：✅ 成功加入 JSON metadata track（新功能）
   - 支援 NDJSON 格式輸入，每行包含 frame_id
   - 使用 METT sample entry with application/json MIME type
@@ -546,10 +559,10 @@ make test_suite
    - 修復：添加 `GF_EXPORT` 宏確保符號正確導出
 
 2. **MP4MuxDemux 工具擴展**
-   - 新增 `demux_frames` - 逐幀提取 H.264（支援 1000+ 幀）
+   - 新增 `demux_frames` - 逐幀提取 H.264（支援 1000+ 幀）+ **自動提取 metadata track** ⭐
    - 新增 `add_metadata_track` - 嵌入 JSON 檢測結果
    - 新增 `extract_metadata_track` - 提取元數據回到 NDJSON
-   - 新增 `make30` - 生成 30 秒測試 MP4
+   - 新增 `make30` - 生成 30 秒測試 MP4（包含 metadata track）
 
 3. **使用案例**
    - ✅ 人臉/物體檢測結果嵌入（含邊界框坐標）

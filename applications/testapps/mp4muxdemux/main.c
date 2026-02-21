@@ -604,6 +604,30 @@ static GF_Err build_demux_frames(const char *in_mp4, const char *out_frames_dir)
     // Clean up temp file
     unlink(temp_h264);
     
+    if (e < GF_OK) {
+        return e;
+    }
+    
+    // Also extract metadata track if present
+    GF_ISOFile *file = gf_isom_open(in_mp4, GF_ISOM_OPEN_READ, NULL);
+    if (file) {
+        u32 metadata_track = find_json_metadata_track(file);
+        if (metadata_track) {
+            char metadata_path[GF_MAX_PATH];
+            snprintf(metadata_path, sizeof(metadata_path), "%s/metadata.ndjson", out_frames_dir);
+            
+            gf_isom_close(file);
+            
+            // Extract metadata to NDJSON file
+            GF_Err meta_err = extract_metadata_track(in_mp4, metadata_path);
+            if (meta_err >= GF_OK) {
+                fprintf(stderr, "✅ Extracted metadata track to %s\n", metadata_path);
+            }
+        } else {
+            gf_isom_close(file);
+        }
+    }
+    
     return e;
 }
 
@@ -905,38 +929,105 @@ static GF_Err build_concat_h264(const char *frames_dir, const char *out_path, u3
     return GF_OK;
 }
 
+/* 生成 metadata NDJSON 文件 */
+static GF_Err build_metadata_ndjson(const char *out_path, u32 total_frames)
+{
+    FILE *f = fopen(out_path, "w");
+    if (!f) {
+        fprintf(stderr, "Failed to create metadata file: %s\n", out_path);
+        return GF_URL_ERROR;
+    }
+
+    /* 每 50 幀生成一次 metadata（類似 realtime_example.c） */
+    for (u32 frame_id = 0; frame_id < total_frames; frame_id++) {
+        if (frame_id % 50 == 0) {
+            /* 每 100 幀切換有無檢測對象 */
+            int has_detection = (frame_id % 100 < 30);
+            
+            if (has_detection) {
+                fprintf(f, "{\"frame_id\":%u,\"timestamp_ms\":%u,\"objects\":["
+                          "{\"class\":\"person\",\"x\":100,\"y\":150,\"w\":80,\"h\":200,\"confidence\":0.95},"
+                          "{\"class\":\"car\",\"x\":250,\"y\":120,\"w\":150,\"h\":100,\"confidence\":0.87}"
+                          "]}\n",
+                        frame_id, frame_id * 33);  /* 30 fps = 33ms per frame */
+            } else {
+                fprintf(f, "{\"frame_id\":%u,\"timestamp_ms\":%u,\"objects\":[]}\n",
+                        frame_id, frame_id * 33);
+            }
+        }
+    }
+
+    fclose(f);
+    return GF_OK;
+}
+
 static GF_Err build_sample_30s(void)
 {
     const char *frames_dir = "applications/testapps/mp4muxdemux/h264";
     const char *aac_path = "applications/testapps/mp4muxdemux/aac.aac";
     const char *out_mp4 = "applications/testapps/mp4muxdemux/out_30s.mp4";
+    const char *tmp_mp4 = "applications/testapps/mp4muxdemux/out_30s_tmp.mp4";
     const char *fps_str = "30";
     const u32 target_seconds = 30;
     const u32 fps = 30;
     const u32 total_frames = target_seconds * fps;
     char concat_path[GF_MAX_PATH];
     char concat_aac_path[GF_MAX_PATH];
+    char metadata_path[GF_MAX_PATH];
 
     snprintf(concat_path, sizeof(concat_path), "%s/concat_30s.h264", frames_dir);
     snprintf(concat_aac_path, sizeof(concat_aac_path), "%s/concat_30s.aac", frames_dir);
+    snprintf(metadata_path, sizeof(metadata_path), "%s/metadata_30s.ndjson", frames_dir);
 
+    /* 1. 生成 H.264 stream */
     GF_Err e = build_concat_h264(frames_dir, concat_path, total_frames);
     if (e < GF_OK) {
         fprintf(stderr, "Failed to build H.264 stream: %s\n", gf_error_to_string(e));
         return e;
     }
 
+    /* 2. 生成 AAC stream */
     e = build_concat_aac_for_seconds(aac_path, concat_aac_path, target_seconds);
     if (e < GF_OK) {
         remove(concat_path);
-        remove(concat_aac_path);
         fprintf(stderr, "Failed to build AAC stream: %s\n", gf_error_to_string(e));
         return e;
     }
 
-    e = build_mux(concat_path, concat_aac_path, out_mp4, fps_str);
+    /* 3. 生成 metadata NDJSON */
+    e = build_metadata_ndjson(metadata_path, total_frames);
+    if (e < GF_OK) {
+        remove(concat_path);
+        remove(concat_aac_path);
+        fprintf(stderr, "Failed to build metadata: %s\n", gf_error_to_string(e));
+        return e;
+    }
+
+    /* 4. Mux video + audio 到臨時檔案 */
+    e = build_mux(concat_path, concat_aac_path, tmp_mp4, fps_str);
+    if (e < GF_OK) {
+        remove(concat_path);
+        remove(concat_aac_path);
+        remove(metadata_path);
+        fprintf(stderr, "Failed to mux video+audio: %s\n", gf_error_to_string(e));
+        return e;
+    }
+
+    /* 5. 添加 metadata track */
+    e = add_metadata_track(tmp_mp4, metadata_path, out_mp4);
+    
+    /* 清理臨時檔案 */
     remove(concat_path);
     remove(concat_aac_path);
+    remove(metadata_path);
+    remove(tmp_mp4);
+    
+    if (e < GF_OK) {
+        fprintf(stderr, "Failed to add metadata track: %s\n", gf_error_to_string(e));
+        return e;
+    }
+
+    fprintf(stderr, "✅ Successfully created %s with video, audio, and metadata tracks\n", out_mp4);
     return e;
 }
 
