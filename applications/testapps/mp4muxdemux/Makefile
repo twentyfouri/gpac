@@ -15,26 +15,32 @@ LDFLAGS+=-pg
 endif
 
 OBJS= main.o
+RT_OBJS= realtime_example.o realtime_mp4.o
 
 LINKFLAGS=-L../../../bin/gcc
 ifeq ($(CONFIG_WIN32),yes)
 EXE=.exe
 PROG=mp4muxdemux$(EXE)
+RT_PROG=realtime_example$(EXE)
 else
 EXT=
 PROG=mp4muxdemux
+RT_PROG=realtime_example
 endif
 LINKFLAGS+=-lgpac
 
-SRCS := $(OBJS:.o=.c)
+SRCS := $(OBJS:.o=.c) $(RT_OBJS:.o=.c)
 
-all: $(PROG)
+all: $(PROG) $(RT_PROG)
 
 $(PROG): $(OBJS)
 	$(CC) -o ../../../bin/gcc/$@ $(OBJS) $(LINKFLAGS) $(LDFLAGS)
 
+$(RT_PROG): $(RT_OBJS)
+	$(CC) -o ../../../bin/gcc/$@ $(RT_OBJS) $(LINKFLAGS) $(LDFLAGS)
+
 clean:
-	rm -f $(OBJS) ../../../bin/gcc/$(PROG)
+	rm -f $(OBJS) $(RT_OBJS) ../../../bin/gcc/$(PROG) ../../../bin/gcc/$(RT_PROG)
 
 dep: depend
 

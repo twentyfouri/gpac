@@ -1318,6 +1318,7 @@ GF_Err gf_isom_stxt_get_description(GF_ISOFile *the_file, u32 trackNumber, u32 S
 }
 
 #ifndef GPAC_DISABLE_ISOM_WRITE
+GF_EXPORT
 GF_Err gf_isom_new_stxt_description(GF_ISOFile *movie, u32 trackNumber, u32 type,
                                     const char *mime, const char *encoding, const char * config,
                                     u32 *outDescriptionIndex)

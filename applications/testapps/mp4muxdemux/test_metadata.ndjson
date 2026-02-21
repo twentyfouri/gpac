@@ -1,0 +1,4 @@
+{"frame_id":0,"objects":[]}
+{"frame_id":1,"objects":[{"class":"person","x":100,"y":150,"w":80,"h":200}]}
+{"frame_id":5,"objects":[{"class":"person","x":110,"y":160,"w":85,"h":205}]}
+{"frame_id":10,"objects":[{"class":"person","x":105,"y":155,"w":82,"h":202}]}

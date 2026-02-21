@@ -5,9 +5,12 @@
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <ctype.h>
+#include <sys/types.h>
 
 #include <gpac/filters.h>
 #include <gpac/tools.h>
+#include <gpac/isomedia.h>
 
 static void print_usage(const char *exe)
 {
@@ -16,14 +19,18 @@ static void print_usage(const char *exe)
         "  %s mux <in.h264> <in.aac> <out.mp4> <fps>\n"
         "  %s demux <in.mp4> <out.h264> <out.aac>\n"
         "  %s demux_frames <in.mp4> <out_frames_dir>\n"
+        "  %s add_metadata_track <in.mp4> <metadata.ndjson> <out.mp4>\n"
+        "  %s extract_metadata_track <in.mp4> <out.ndjson>\n"
         "  %s make30\n"
         "\n"
         "Notes:\n"
         "  - H.264 input must be Annex B (start codes).\n"
         "  - AAC input must be ADTS.\n"
         "  - fps can be like 30 or 30000/1001.\n"
-        "  - demux_frames: extract each H.264 frame to separate file in folder.\n",
-    exe, exe, exe, exe);
+        "  - demux_frames: extract each H.264 frame to separate file in folder.\n"
+        "  - metadata.ndjson: one JSON object per line with frame_id.\n"
+        "  - metadata track uses timescale 30 and METT (application/json).\n",
+    exe, exe, exe, exe, exe, exe);
 }
 
 static GF_Err run_session(GF_FilterSession *fs)
@@ -160,6 +167,324 @@ static GF_Err build_demux(const char *in_mp4, const char *out_h264, const char *
         return e;
     }
     return build_demux_one(in_mp4, "audio", out_aac, "ufadts");
+}
+
+typedef struct
+{
+    u32 frame_id;
+    char *json;
+} FrameJson;
+
+typedef struct
+{
+    FrameJson *items;
+    u32 count;
+    u32 cap;
+} FrameJsonList;
+
+static void frame_json_list_free(FrameJsonList *list)
+{
+    if (!list || !list->items) {
+        return;
+    }
+    for (u32 i = 0; i < list->count; i++) {
+        free(list->items[i].json);
+    }
+    free(list->items);
+    list->items = NULL;
+    list->count = 0;
+    list->cap = 0;
+}
+
+static GF_Err frame_json_list_add(FrameJsonList *list, u32 frame_id, char *json)
+{
+    if (list->count == list->cap) {
+        u32 new_cap = list->cap ? list->cap * 2 : 64;
+        FrameJson *new_items = (FrameJson *)realloc(list->items, new_cap * sizeof(FrameJson));
+        if (!new_items) {
+            return GF_OUT_OF_MEM;
+        }
+        list->items = new_items;
+        list->cap = new_cap;
+    }
+    list->items[list->count].frame_id = frame_id;
+    list->items[list->count].json = json;
+    list->count++;
+    return GF_OK;
+}
+
+static char *trim_line(char *line)
+{
+    if (!line) {
+        return line;
+    }
+    while (isspace((unsigned char)*line)) {
+        line++;
+    }
+    if (!*line) {
+        return line;
+    }
+    char *end = line + strlen(line) - 1;
+    while (end > line && isspace((unsigned char)*end)) {
+        *end-- = '\0';
+    }
+    return line;
+}
+
+static Bool parse_frame_id(const char *line, u32 *out_frame_id)
+{
+    const char *p = strstr(line, "\"frame_id\"");
+    if (!p) {
+        p = strstr(line, "frame_id");
+    }
+    if (!p) {
+        return GF_FALSE;
+    }
+    p = strchr(p, ':');
+    if (!p) {
+        return GF_FALSE;
+    }
+    p++;
+    while (isspace((unsigned char)*p)) {
+        p++;
+    }
+    char *end = NULL;
+    long v = strtol(p, &end, 10);
+    if (end == p || v < 0) {
+        return GF_FALSE;
+    }
+    *out_frame_id = (u32)v;
+    return GF_TRUE;
+}
+
+static GF_Err load_frame_json_lines(const char *json_path, char ***out_frames, u32 *out_frame_count, u32 *out_max_frame)
+{
+    FILE *f = fopen(json_path, "rb");
+    if (!f) {
+        fprintf(stderr, "Failed to open metadata file: %s\n", json_path);
+        return GF_URL_ERROR;
+    }
+
+    FrameJsonList list = {0};
+    char *line = NULL;
+    size_t cap = 0;
+    ssize_t len = 0;
+    u32 max_frame = 0;
+
+    while ((len = getline(&line, &cap, f)) != -1) {
+        char *trimmed = trim_line(line);
+        if (!trimmed[0]) {
+            continue;
+        }
+        u32 frame_id = 0;
+        if (!parse_frame_id(trimmed, &frame_id)) {
+            fprintf(stderr, "Invalid metadata line (missing frame_id): %s\n", trimmed);
+            free(line);
+            fclose(f);
+            frame_json_list_free(&list);
+            return GF_BAD_PARAM;
+        }
+        char *json_copy = strdup(trimmed);
+        if (!json_copy) {
+            free(line);
+            fclose(f);
+            frame_json_list_free(&list);
+            return GF_OUT_OF_MEM;
+        }
+        GF_Err e = frame_json_list_add(&list, frame_id, json_copy);
+        if (e < GF_OK) {
+            free(line);
+            fclose(f);
+            frame_json_list_free(&list);
+            return e;
+        }
+        if (frame_id > max_frame) {
+            max_frame = frame_id;
+        }
+    }
+
+    free(line);
+    fclose(f);
+
+    if (!list.count) {
+        frame_json_list_free(&list);
+        fprintf(stderr, "No metadata entries found in %s\n", json_path);
+        return GF_BAD_PARAM;
+    }
+
+    u32 frame_count = max_frame + 1;
+    char **frames = (char **)calloc(frame_count, sizeof(char *));
+    if (!frames) {
+        frame_json_list_free(&list);
+        return GF_OUT_OF_MEM;
+    }
+
+    for (u32 i = 0; i < list.count; i++) {
+        u32 fid = list.items[i].frame_id;
+        if (fid < frame_count) {
+            if (frames[fid]) {
+                free(frames[fid]);
+            }
+            frames[fid] = list.items[i].json;
+            list.items[i].json = NULL;
+        }
+    }
+
+    frame_json_list_free(&list);
+    *out_frames = frames;
+    *out_frame_count = frame_count;
+    *out_max_frame = max_frame;
+    return GF_OK;
+}
+
+static u32 find_json_metadata_track(GF_ISOFile *file)
+{
+    u32 track_count = gf_isom_get_track_count(file);
+    u32 fallback_track = 0;
+    for (u32 i = 1; i <= track_count; i++) {
+        u32 media_type = gf_isom_get_media_type(file, i);
+        if (media_type != GF_ISOM_MEDIA_META) {
+            continue;
+        }
+        u32 subtype = gf_isom_get_media_subtype(file, i, 1);
+        if (subtype != GF_ISOM_SUBTYPE_METT) {
+            continue;
+        }
+        const char *mime = NULL;
+        gf_isom_stxt_get_description(file, i, 1, &mime, NULL, NULL);
+        if (mime && strstr(mime, "application/json")) {
+            return i;
+        }
+        if (!fallback_track) {
+            fallback_track = i;
+        }
+    }
+    return fallback_track;
+}
+
+static GF_Err add_metadata_track(const char *in_mp4, const char *json_path, const char *out_mp4)
+{
+    GF_ISOFile *file = gf_isom_open(in_mp4, GF_ISOM_OPEN_EDIT, NULL);
+    if (!file) {
+        fprintf(stderr, "Failed to open input MP4: %s\n", in_mp4);
+        return GF_URL_ERROR;
+    }
+    GF_Err e = gf_isom_set_final_name(file, (char *)out_mp4);
+    if (e < GF_OK) {
+        gf_isom_close(file);
+        return e;
+    }
+
+    u32 track = gf_isom_new_track(file, 0, GF_ISOM_MEDIA_META, 30);
+    if (!track) {
+        gf_isom_close(file);
+        return GF_IO_ERR;
+    }
+
+    u32 desc_index = 0;
+    e = gf_isom_new_stxt_description(file, track, GF_ISOM_SUBTYPE_METT, "application/json", "utf-8", NULL, &desc_index);
+    if (e < GF_OK) {
+        gf_isom_close(file);
+        return e;
+    }
+
+    char **frames = NULL;
+    u32 frame_count = 0;
+    u32 max_frame = 0;
+    e = load_frame_json_lines(json_path, &frames, &frame_count, &max_frame);
+    if (e < GF_OK) {
+        gf_isom_close(file);
+        return e;
+    }
+
+    GF_ISOSample *sample = gf_isom_sample_new();
+    if (!sample) {
+        for (u32 i = 0; i < frame_count; i++) {
+            free(frames[i]);
+        }
+        free(frames);
+        gf_isom_close(file);
+        return GF_OUT_OF_MEM;
+    }
+
+    for (u32 i = 0; i < frame_count; i++) {
+        char fallback[128];
+        const char *payload = frames[i];
+        if (!payload) {
+            snprintf(fallback, sizeof(fallback), "{\"frame_id\":%u,\"objects\":[]}", i);
+            payload = fallback;
+        }
+        sample->DTS = i;
+        sample->CTS_Offset = 0;
+        sample->IsRAP = RAP;
+        sample->data = (u8 *)payload;
+        sample->dataLength = (u32)strlen(payload);
+        sample->nb_pack = 0;
+
+        e = gf_isom_add_sample(file, track, desc_index, sample);
+        if (e < GF_OK) {
+            break;
+        }
+    }
+
+    sample->dataLength = 0;
+    gf_isom_sample_del(&sample);
+    for (u32 i = 0; i < frame_count; i++) {
+        free(frames[i]);
+    }
+    free(frames);
+
+    if (e < GF_OK) {
+        gf_isom_close(file);
+        return e;
+    }
+    return gf_isom_close(file);
+}
+
+static GF_Err extract_metadata_track(const char *in_mp4, const char *out_json)
+{
+    GF_ISOFile *file = gf_isom_open(in_mp4, GF_ISOM_OPEN_READ, NULL);
+    if (!file) {
+        fprintf(stderr, "Failed to open input MP4: %s\n", in_mp4);
+        return GF_URL_ERROR;
+    }
+
+    u32 track = find_json_metadata_track(file);
+    if (!track) {
+        gf_isom_close(file);
+        fprintf(stderr, "No JSON metadata track found in %s\n", in_mp4);
+        return GF_BAD_PARAM;
+    }
+
+    FILE *out = fopen(out_json, "wb");
+    if (!out) {
+        gf_isom_close(file);
+        fprintf(stderr, "Failed to write output file: %s\n", out_json);
+        return GF_IO_ERR;
+    }
+
+    u32 sample_count = gf_isom_get_sample_count(file, track);
+    for (u32 i = 1; i <= sample_count; i++) {
+        u32 desc_index = 0;
+        GF_ISOSample *sample = gf_isom_get_sample(file, track, i, &desc_index);
+        if (!sample) {
+            fclose(out);
+            gf_isom_close(file);
+            return GF_IO_ERR;
+        }
+        u32 frame_id = (u32)sample->DTS;
+        if (sample->dataLength) {
+            fwrite(sample->data, 1, sample->dataLength, out);
+            fwrite("\n", 1, 1, out);
+        } else {
+            fprintf(out, "{\"frame_id\":%u,\"objects\":[]}" "\n", frame_id);
+        }
+        gf_isom_sample_del(&sample);
+    }
+
+    fclose(out);
+    gf_isom_close(file);
+    return GF_OK;
 }
 
 // Split H.264 file into individual frames
@@ -646,6 +971,20 @@ int main(int argc, char **argv)
             return 2;
         }
         e = build_demux_frames(argv[2], argv[3]);
+    } else if (!strcmp(argv[1], "add_metadata_track")) {
+        if (argc != 5) {
+            print_usage(argv[0]);
+            gf_sys_close();
+            return 2;
+        }
+        e = add_metadata_track(argv[2], argv[3], argv[4]);
+    } else if (!strcmp(argv[1], "extract_metadata_track")) {
+        if (argc != 4) {
+            print_usage(argv[0]);
+            gf_sys_close();
+            return 2;
+        }
+        e = extract_metadata_track(argv[2], argv[3]);
     } else if (!strcmp(argv[1], "make30")) {
         if (argc != 2) {
             print_usage(argv[0]);
