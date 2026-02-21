@@ -22,24 +22,63 @@
 
 /* ========== 模拟数据生成器 ========== */
 
-/* 生成简单的 H.264 NAL 单元（用于测试） */
+/* 从 h264/ 目录加载真实 H.264 幀（循环使用 test_frame0.h264 到 test_frame59.h264） */
 u8* generate_h264_frame(u32 frame_id, u32 *size) {
-    /* 实际应用中这会来自摄像头/编码器 */
-    u8 *nal = (u8 *)malloc(1024);
+    /* 从 h264 目录循环读取真实幀，共 60 个幀 */
+    static u8 *cache[60] = {NULL};
+    static u32 cache_size[60] = {0};
+    static Bool cache_loaded = GF_FALSE;
     
-    /* 模拟 NAL 单元：0x00 0x00 0x01 [type] [frame_id_bytes] */
-    nal[0] = 0x00;
-    nal[1] = 0x00;
-    nal[2] = 0x01;
-    nal[3] = 0x65;  /* H.264 NAL type 5 (IDR) */
+    u32 frame_index = frame_id % 60;  /* 循环使用 */
     
-    /* 填充一些假数据 */
-    for (u32 i = 4; i < 512; i++) {
-        nal[i] = (u8)((frame_id + i) & 0xFF);
+    /* 首次加载所有幀到缓存 */
+    if (!cache_loaded) {
+        for (u32 i = 0; i < 60; i++) {
+            char path[256];
+            FILE *f;
+            
+            snprintf(path, sizeof(path), 
+                    "h264/test_frame%u.h264", i);
+            
+            f = fopen(path, "rb");
+            if (!f) {
+                fprintf(stderr, "[ERROR] Cannot open %s\n", path);
+                continue;
+            }
+            
+            /* 获取文件大小 */
+            fseek(f, 0, SEEK_END);
+            u32 file_size = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            
+            /* 分配和读取 */
+            cache[i] = (u8 *)malloc(file_size);
+            if (cache[i]) {
+                fread(cache[i], 1, file_size, f);
+                cache_size[i] = file_size;
+            }
+            
+            fclose(f);
+            fprintf(stderr, "[LOAD] h264/test_frame%u.h264 (%u bytes)\n", i, file_size);
+        }
+        cache_loaded = GF_TRUE;
     }
     
-    *size = 512;
-    return nal;
+    /* 返回缓存的幀 */
+    if (cache[frame_index]) {
+        *size = cache_size[frame_index];
+        
+        /* 分配新数据以供调用者释放 */
+        u8 *frame_copy = (u8 *)malloc(*size);
+        memcpy(frame_copy, cache[frame_index], *size);
+        
+        return frame_copy;
+    }
+    
+    /* 如果加载失败，返回空 */
+    fprintf(stderr, "[ERROR] Frame %u not loaded\n", frame_index);
+    *size = 0;
+    return NULL;
 }
 
 /* 生成简单的 AAC 音频（用于测试） */
@@ -95,7 +134,7 @@ int main(int argc, char **argv) {
     printf("[Main] 创建实时 MP4 文件...\n");
     RealtimeMP4Writer *writer = realtime_mp4_open(
         "/tmp/realtime_output.mp4",
-        320, 240,        /* 视频分辨率 */
+        1280, 720,       /* 视频分辨率 (H.264 test frames: 1280x720) */
         30,              /* 30 fps */
         48000,           /* 48 kHz 音频 */
         2                /* 立体声 */
@@ -113,62 +152,64 @@ int main(int argc, char **argv) {
     printf("       视频：30 fps (每 33ms 一帧)\n");
     printf("       音频：48 kHz (每 43ms 一个 frame)\n");
     printf("       元数据：每 5 帧检测一次对象\n");
-    printf("       运行时长：~3 秒\n\n");
+    printf("       运行时长：~15 秒 (450 video frames)\n\n");
 
     u64 start_time = realtime_mp4_get_time_us();
     u32 frame_count = 0;
     u32 audio_frame_count = 0;
-    u32 last_fragment_time = 0;
+    u32 last_fragment_frame = 0;
 
-    /* 模拟 ~3 秒的录制 */
-    while (frame_count < 100) {
-        u64 current_time_us = realtime_mp4_get_time_us() - start_time;
+    /* 模拟 ~15 秒的录制 (450 video frames @ 30 fps) */
+    while (frame_count < 450) {
+        /* 使用幀計數器計算理論時間戳（保證嚴格遞增） */
+        u64 video_timestamp_us = start_time + (u64)frame_count * 33333ULL;  /* 30 fps = 33.333ms per frame */
+        u64 audio_timestamp_us = start_time + (u64)audio_frame_count * 21333ULL;  /* 48kHz, 1024 samples per frame = 21.333ms */
         
-        /* 每 33ms 产生一个视频帧 (30 fps) */
-        if (current_time_us >= frame_count * 33333) {
-            u32 nal_size = 0;
-            u8 *h264_frame = generate_h264_frame(frame_count, &nal_size);
-            
-            realtime_mp4_add_video_frame(writer, h264_frame, nal_size, 
-                                        start_time + current_time_us);
-            
-            /* 每 5 帧产生元数据 */
-            if (frame_count % 5 == 0) {
-                char *metadata = generate_metadata(frame_count, frame_count % 10 < 3);
-                realtime_mp4_add_metadata(writer, metadata, 
-                                         start_time + current_time_us);
-                free(metadata);
-            }
-            
-            if (frame_count % 20 == 0) {
-                printf("[%4u ms] 视频帧 #%u\n", 
-                       (u32)(current_time_us / 1000), frame_count);
-            }
-            
-            free(h264_frame);
-            frame_count++;
+        /* 产生视频帧 */
+        u32 nal_size = 0;
+        u8 *h264_frame = generate_h264_frame(frame_count, &nal_size);
+        
+        realtime_mp4_add_video_frame(writer, h264_frame, nal_size, video_timestamp_us);
+        
+        /* 每 50 帧产生元数据 */
+        if (frame_count % 50 == 0) {
+            char *metadata = generate_metadata(frame_count, frame_count % 100 < 30);
+            realtime_mp4_add_metadata(writer, metadata, video_timestamp_us);
+            free(metadata);
         }
         
-        /* 每 43ms 产生一个音频 frame (48 kHz) */
-        if (current_time_us >= audio_frame_count * 42667) {
-            u32 aac_size = 0;
-            u8 *aac_frame = generate_aac_frame(audio_frame_count, 2048, &aac_size);
+        if (frame_count % 100 == 0) {
+            printf("[%4llu ms] 视频帧 #%u\n", 
+                   (video_timestamp_us - start_time) / 1000, frame_count);
+        }
+        
+        free(h264_frame);
+        frame_count++;
+        
+        /* 产生相应的音频帧（保持 A/V 同步） */
+        /* 音頻：48kHz 採樣率，每幀 1024 樣本 = 21.333ms/幀 */
+        u32 expected_audio_frames = (frame_count * 33333ULL) / 21333ULL;
+        while (audio_frame_count < expected_audio_frames) {
+            audio_timestamp_us = start_time + (u64)audio_frame_count * 21333ULL;
             
-            realtime_mp4_add_audio_samples(writer, aac_frame, aac_size,
-                                          start_time + current_time_us);
+            u32 aac_size = 0;
+            u8 *aac_frame = generate_aac_frame(audio_frame_count, 1024, &aac_size);
+            
+            realtime_mp4_add_audio_samples(writer, aac_frame, aac_size, audio_timestamp_us);
             
             free(aac_frame);
             audio_frame_count++;
         }
         
-        /* 每 1 秒创建一个片段边界 */
-        u32 current_seconds = (u32)(current_time_us / 1000000);
-        if (current_seconds > last_fragment_time && current_seconds % 1 == 0) {
+        /* 每 150 幀（5 秒）創建一個片段邊界 */
+        if (frame_count > 0 && frame_count % 150 == 0 && frame_count != last_fragment_frame) {
             realtime_mp4_flush_fragment(writer);
-            last_fragment_time = current_seconds;
+            last_fragment_frame = frame_count;
+            printf("  [FRAGMENT] Created at frame %u (%.2f seconds)\n", 
+                   frame_count, frame_count / 30.0);
         }
         
-        /* 短暂睡眠以避免 CPU 忙转 */
+        /* 短暂睡眠以模拟实时录制 */
         usleep(1000);  /* 1ms */
     }
 

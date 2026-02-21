@@ -49,6 +49,11 @@ typedef struct {
     u64 last_audio_timestamp;   /* 最后一个音频样本的时间戳 */
     u64 last_metadata_timestamp;/* 最后一个元数据样本的时间戳 */
     
+    /* DTS 追蹤（用於設置 tfdt） */
+    u64 next_video_dts;         /* 下一個視頻樣本的 DTS（timescale 單位） */
+    u64 next_audio_dts;         /* 下一個音頻樣本的 DTS（timescale 單位） */
+    u64 next_metadata_dts;      /* 下一個元數據樣本的 DTS（timescale 單位） */
+    
     /* 片段管理 */
     u32 fragment_counter;
     u64 fragment_duration_us;   /* 片段时长 1 秒 */

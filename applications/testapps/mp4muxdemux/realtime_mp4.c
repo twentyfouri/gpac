@@ -190,6 +190,11 @@ RealtimeMP4Writer *realtime_mp4_open(const char *mp4_path, u32 width, u32 height
     writer->fragment_counter = 0;
     writer->fragment_duration_us = 1000000;
     writer->next_fragment_time_us = writer->start_time_us + writer->fragment_duration_us;
+    
+    /* 初始化 DTS 追蹤 */
+    writer->next_video_dts = 0;
+    writer->next_audio_dts = 0;
+    writer->next_metadata_dts = 0;
 
     return writer;
 }
@@ -218,6 +223,8 @@ GF_Err realtime_mp4_add_video_frame(RealtimeMP4Writer *writer, const u8 *h264_da
     sample->IsRAP = (writer->video_sample_count == 0) ? RAP : 0;
 
     u32 duration = writer->video_timescale / writer->video_fps;
+    u64 sample_dts = sample->DTS;  /* 保存 DTS，因為 sample 會被釋放 */
+    
     GF_Err e = gf_isom_fragment_add_sample(writer->file, writer->video_track_id, sample,
                                            writer->video_desc_idx, duration, 0, 0, GF_FALSE);
 
@@ -227,6 +234,8 @@ GF_Err realtime_mp4_add_video_frame(RealtimeMP4Writer *writer, const u8 *h264_da
     if (e >= GF_OK) {
         writer->video_sample_count++;
         writer->last_video_timestamp = timestamp_us;
+        /* 更新下一個 DTS（用於設置下一個片段的 tfdt） */
+        writer->next_video_dts = sample_dts + duration;
     }
 
     return e;
@@ -256,6 +265,8 @@ GF_Err realtime_mp4_add_audio_samples(RealtimeMP4Writer *writer, const u8 *aac_d
     sample->IsRAP = RAP;
 
     u32 duration = 1024;
+    u64 sample_dts = sample->DTS;  /* 保存 DTS */
+    
     GF_Err e = gf_isom_fragment_add_sample(writer->file, writer->audio_track_id, sample,
                                            writer->audio_desc_idx, duration, 0, 0, GF_FALSE);
 
@@ -265,6 +276,8 @@ GF_Err realtime_mp4_add_audio_samples(RealtimeMP4Writer *writer, const u8 *aac_d
     if (e >= GF_OK) {
         writer->audio_sample_count++;
         writer->last_audio_timestamp = timestamp_us;
+        /* 更新下一個 DTS */
+        writer->next_audio_dts = sample_dts + duration;
     }
 
     return e;
@@ -294,8 +307,11 @@ GF_Err realtime_mp4_add_metadata(RealtimeMP4Writer *writer, const char *json_pay
     sample->CTS_Offset = 0;
     sample->IsRAP = RAP;
 
+    u32 duration = 1;
+    u64 sample_dts = sample->DTS;  /* 保存 DTS */
+    
     GF_Err e = gf_isom_fragment_add_sample(writer->file, writer->metadata_track_id, sample,
-                                           writer->metadata_desc_idx, 1, 0, 0, GF_FALSE);
+                                           writer->metadata_desc_idx, duration, 0, 0, GF_FALSE);
 
     sample->dataLength = 0;
     gf_isom_sample_del(&sample);
@@ -303,6 +319,8 @@ GF_Err realtime_mp4_add_metadata(RealtimeMP4Writer *writer, const char *json_pay
     if (e >= GF_OK) {
         writer->metadata_sample_count++;
         writer->last_metadata_timestamp = timestamp_us;
+        /* 更新下一個 DTS */
+        writer->next_metadata_dts = sample_dts + duration;
     }
 
     return e;
@@ -314,12 +332,38 @@ GF_Err realtime_mp4_flush_fragment(RealtimeMP4Writer *writer)
         return GF_BAD_PARAM;
     }
 
+    /* 開始新片段 */
     GF_Err e = gf_isom_start_fragment(writer->file, GF_ISOM_FRAG_MOOF_FIRST);
-    if (e >= GF_OK) {
-        writer->fragment_counter++;
-        writer->next_fragment_time_us = realtime_mp4_get_time_us() + writer->fragment_duration_us;
+    if (e < GF_OK) {
+        return e;
     }
-    return e;
+    
+    /* 為每個軌道設置 base media decode time（tfdt box）*/
+    if (writer->video_sample_count > 0) {
+        e = gf_isom_set_traf_base_media_decode_time(writer->file, writer->video_track_id, writer->next_video_dts);
+        if (e < GF_OK) {
+            return e;
+        }
+    }
+    
+    if (writer->audio_sample_count > 0) {
+        e = gf_isom_set_traf_base_media_decode_time(writer->file, writer->audio_track_id, writer->next_audio_dts);
+        if (e < GF_OK) {
+            return e;
+        }
+    }
+    
+    if (writer->metadata_sample_count > 0) {
+        e = gf_isom_set_traf_base_media_decode_time(writer->file, writer->metadata_track_id, writer->next_metadata_dts);
+        if (e < GF_OK) {
+            return e;
+        }
+    }
+    
+    writer->fragment_counter++;
+    writer->next_fragment_time_us = realtime_mp4_get_time_us() + writer->fragment_duration_us;
+    
+    return GF_OK;
 }
 
 u64 realtime_mp4_get_duration_ms(RealtimeMP4Writer *writer)
@@ -355,7 +399,15 @@ GF_Err realtime_mp4_close(RealtimeMP4Writer *writer)
     }
 
     if (writer->file) {
+        /* 設置軌道為 enabled（在 fragmented MP4 中軌道默認是 disabled） */
+        gf_isom_set_track_enabled(writer->file, writer->video_track, GF_TRUE);
+        gf_isom_set_track_enabled(writer->file, writer->audio_track, GF_TRUE);
+        gf_isom_set_track_enabled(writer->file, writer->metadata_track, GF_TRUE);
+        
+        /* 關閉 fragments 並寫入最後的數據 */
         gf_isom_close_fragments(writer->file);
+        
+        /* 關閉文件 */
         gf_isom_close(writer->file);
         writer->file = NULL;
     }
